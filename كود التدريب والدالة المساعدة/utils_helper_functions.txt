@@ -1,0 +1,64 @@
+% ==============================================================================
+% Copyright (c) 2026, Eng. Mohammed Ezzeldin Babiker Abdullah. All rights reserved.
+% Official Project & Research Work by م. محمد عزالدين بابكر عبدالله
+% ==============================================================================
+function GHI_cs = calculate_simple_clearsky_optimized(date_vec, lat, lon, alt)
+% calculate_simple_clearsky_optimized: Fast and optimized function to calculate Clear-Sky GHI
+% Inputs:
+%   date_vec: Date and time vector [Year, Month, Day, Hour, Minute, Second]
+%   lat: Latitude in degrees
+%   lon: Longitude in degrees
+%   alt: Altitude above sea level in meters
+% Output:
+%   GHI_cs: Theoretical Clear-Sky Global Horizontal Irradiance in W/m^2
+
+    % 1. Time and Date Conversion
+    year = date_vec(1);
+    month = date_vec(2);
+    day = date_vec(3);
+    hour = date_vec(4) + date_vec(5)/60 + date_vec(6)/3600; % Decimal hour
+
+    % Calculate Day of Year (DOY)
+    dn = datenum(year, month, day) - datenum(year, 1, 1) + 1;
+
+    % 2. Solar Geometry Calculations
+    
+    % Hour Angle (omega)
+    % Assumption: 15 degrees per hour, Solar Noon at 12:00
+    omega = (hour - 12) * 15; % Degrees
+
+    % Solar Declination (delta) - Cooper's Equation
+    delta = 23.45 * sind(360/365 * (dn + 284)); % Degrees
+
+    % Solar Elevation Angle (alpha)
+    sin_alpha = sind(lat) * sind(delta) + cosd(lat) * cosd(delta) * cosd(omega);
+    alpha = asind(sin_alpha); % Degrees
+
+    % Zenith Angle (theta_z)
+    theta_z = 90 - alpha; % Degrees
+
+    % 3. Clear Sky Model Calculation
+    
+    % Solar Constant (Extra-terrestrial Irradiance)
+    I_sc = 1367; % W/m^2
+
+    % Eccentricity Correction Factor (E0)
+    E0 = 1 + 0.033 * cosd(360 * dn / 365);
+
+    % Estimated Atmospheric Transmission Coefficient
+    % Can be adjusted based on regional atmospheric clarity (default = 0.7)
+    tau = 0.7;
+
+    if alpha > 0 % Daytime condition
+        % Base GHI calculation using cosine of zenith angle
+        GHI_cs = I_sc * E0 * max(0, cosd(theta_z)) * tau;
+
+        % Altitude Correction (approx. 1% increase per 100m)
+        alt_correction = 1 + (alt / 10000);
+        GHI_cs = GHI_cs * alt_correction;
+
+    else
+        GHI_cs = 0; % Nighttime
+    end
+
+end

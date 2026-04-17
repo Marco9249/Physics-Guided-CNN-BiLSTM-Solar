@@ -1,0 +1,213 @@
+% ==============================================================================
+% Copyright (c) 2026, Eng. Mohammed Ezzeldin Babiker Abdullah. All rights reserved.
+% Official Project & Research Work by م. محمد عزالدين بابكر عبدالله
+% ==============================================================================
+clear; clc; close all;
+
+fprintf('========================================================\n');
+fprintf('   Starting Bayesian Optimization for CNN-BiLSTM        \n');
+fprintf('   Warning: This process may take several hours         \n');
+fprintf('========================================================\n\n');
+
+filename = 'POWER_Point_Hourly_20100101_20151130_015d57N_032d47E_LST.csv';
+best_model_filename = 'physics_informed_best_model.mat';
+
+lat = 14.7046; lon = 33.194; alt = 404;
+
+disp('>>> [1/7] Loading and Preparing Corrected Data...');
+if ~isfile(filename); error('Data file not found.'); end
+
+warning('off', 'MATLAB:table:ModifiedAndSavedVarnames');
+try
+    raw_data = readtable(filename, 'HeaderLines', 25);
+catch ME
+    error('Failed to read file.\n%s', ME.message);
+end
+
+correct_names = {'YEAR', 'MO', 'DY', 'HR', 'GHI', 'GHIcs', 'DNI', 'DHI', 'KTsat', 'UV', 'Tamb', 'Tdew', 'RH', 'Twet'};
+if width(raw_data) < length(correct_names); error('Incorrect number of columns.'); end
+raw_data.Properties.VariableNames(1:length(correct_names)) = correct_names;
+warning('on', 'MATLAB:table:ModifiedAndSavedVarnames');
+
+data = table();
+data.Datetime = datetime(raw_data.YEAR, raw_data.MO, raw_data.DY, raw_data.HR, 0, 0);
+data.GHI = raw_data.GHI;
+data.Tamb = raw_data.Tamb;
+data.KTsat = raw_data.KTsat; 
+data.DNI = raw_data.DNI;
+data.DHI = raw_data.DHI;
+data.UV = raw_data.UV;
+data.Tdew = raw_data.Tdew;
+data.RH = raw_data.RH;
+data.Twet = raw_data.Twet;
+
+cols_to_clean = {'GHI', 'DNI', 'DHI', 'KTsat', 'UV', 'Tamb', 'Tdew', 'RH', 'Twet'};
+for i = 1:length(cols_to_clean); col = cols_to_clean{i}; data.(col)(data.(col) < -900) = NaN; end
+data = fillmissing(data, 'linear');
+
+dates_vec = datevec(data.Datetime);
+clearsky_ghi = zeros(height(data), 1);
+for i = 1:height(data); clearsky_ghi(i) = calculate_simple_clearsky_optimized(dates_vec(i,:), lat, lon, alt); end
+data.ClearSky = clearsky_ghi;
+
+night_mask = data.ClearSky < 5;
+data.GHI(night_mask) = 0; data.DNI(night_mask) = 0; data.DHI(night_mask) = 0; data.UV(night_mask) = 0; data.ClearSky(night_mask) = 0;
+
+data.KT = data.GHI ./ (data.ClearSky + 1); data.KT(data.KT > 1.2) = 1.2; data.KT(data.KT < 0) = 0;
+data.Volatility = movstd(data.KT, [2 0]);
+
+log_cols = {'GHI', 'DNI', 'DHI', 'Twet', 'Tamb', 'KTsat', 'ClearSky'};
+for i = 1:length(log_cols); col = log_cols{i}; data.(['Log_' col]) = log1p(data.(col)); end
+
+hour_val = hour(data.Datetime); doy_val = day(data.Datetime, 'dayofyear');
+data.Sin_Hr = sin(2 * pi * hour_val / 24); data.Cos_Hr = cos(2 * pi * hour_val / 24);
+data.Sin_Day = sin(2 * pi * doy_val / 365.25); data.Cos_Day = cos(2 * pi * doy_val / 365.25);
+
+features_list = { ...
+    'Log_GHI', 'Tamb', 'Log_Twet', ...
+    'Log_DNI', 'Log_DHI', 'Log_KTsat', 'RH', 'Tdew', ...
+    'Log_ClearSky', 'KT', 'Volatility', ...
+    'Sin_Hr', 'Cos_Hr', 'Sin_Day', 'Cos_Day'
+};
+target_col = 'GHI';
+
+X_all = data{:, features_list}; Y_all = data{:, target_col};
+n = height(data); idx_train = 1:round(0.7*n); idx_val = round(0.7*n)+1:round(0.85*n);
+mu_X = mean(X_all(idx_train, :)); sig_X = std(X_all(idx_train, :)); sig_X(sig_X < 1e-6) = 1;
+X_scaled = (X_all - mu_X) ./ sig_X;
+Y_min = min(Y_all(idx_train)); Y_max = max(Y_all(idx_train));
+Y_normalized = (Y_all - Y_min) / (Y_max - Y_min);
+
+seq_len = 24;
+[XTrain_cell, YTrain_Norm] = create_sequence_cells_local(X_scaled, Y_normalized, idx_train, seq_len);
+[XVal_cell, YVal_Norm] = create_sequence_cells_local(X_scaled, Y_normalized, idx_val, seq_len);
+fprintf('   Data Ready. Number of Features: %d\n', length(features_list));
+
+disp('>>> [2/7] Setting up Bayesian Optimization...');
+optimVars = [
+    optimizableVariable('InitialLearnRate', [1e-4, 1e-2], 'Transform', 'log')
+    optimizableVariable('L2Regularization', [1e-5, 1e-3], 'Transform', 'log')
+    optimizableVariable('DropoutRate', [0.1, 0.5])
+    optimizableVariable('BiLSTMUnits', [100, 250], 'Type', 'integer')
+];
+
+ObjFcn = makeObjFcn(XTrain_cell, YTrain_Norm, XVal_cell, YVal_Norm, length(features_list), Y_min, Y_max);
+
+disp('>>> [3/7] Running Bayesian Search...');
+bayesObject = bayesopt(ObjFcn, optimVars, ...
+    'MaxObjectiveEvaluations', 30, ...
+    'IsObjectiveDeterministic', false, ...
+    'AcquisitionFunctionName', 'expected-improvement-plus', ...
+    'PlotFcn', {@plotObjectiveModel, @plotMinObjective}, ...
+    'Verbose', 1, ...
+    'UseParallel', false);
+
+disp('>>> [4/7] Optimization Finished. Extracting Best Parameters...');
+bestHyperparameters = bayesObject.bestPoint;
+disp(bestHyperparameters);
+
+disp('>>> [5/7] Training Final Model with Best Parameters...');
+num_features = length(features_list);
+layers_best = [
+    sequenceInputLayer(num_features, 'Name', 'Input')
+    convolution1dLayer(3, 64, 'Padding', 'same', 'WeightsInitializer', 'he', 'Name', 'CNN1')
+    batchNormalizationLayer('Name', 'BN1')
+    reluLayer('Name', 'ReLU1')
+    dropoutLayer(bestHyperparameters.DropoutRate, 'Name', 'Drop1')
+    bilstmLayer(bestHyperparameters.BiLSTMUnits, 'OutputMode', 'last', 'Name', 'BiLSTM1')
+    dropoutLayer(bestHyperparameters.DropoutRate, 'Name', 'Drop2')
+    fullyConnectedLayer(64, 'Name', 'FC_Pre')
+    reluLayer('Name', 'ReLU_Pre')
+    fullyConnectedLayer(1, 'Name', 'FC_Final')
+    regressionLayer('Name', 'RegressionOutput')
+];
+
+options_best = trainingOptions('adam', ...
+    'MaxEpochs', 100, ...
+    'MiniBatchSize', 128, ...
+    'InitialLearnRate', bestHyperparameters.InitialLearnRate, ...
+    'L2Regularization', bestHyperparameters.L2Regularization, ...
+    'ValidationData', {XVal_cell, YVal_Norm}, ...
+    'ValidationPatience', 20, ...
+    'Plots', 'training-progress', ...
+    'Verbose', false);
+
+net_best = trainNetwork(XTrain_cell, YTrain_Norm, layers_best, options_best);
+
+disp('>>> [6/7] Final Evaluation on Test Set...');
+idx_test = round(0.85*n)+1:n;
+[XTest_cell, YTest_Actual_Norm] = create_sequence_cells_local(X_scaled, Y_normalized, idx_test, seq_len);
+
+YPred_Normalized = predict(net_best, XTest_cell);
+YPred_GHI = YPred_Normalized * (Y_max - Y_min) + Y_min;
+GHI_Test_Actual = YTest_Actual_Norm * (Y_max - Y_min) + Y_min;
+YPred_GHI(YPred_GHI < 0) = 0;
+min_len = min(length(GHI_Test_Actual), length(YPred_GHI));
+GHI_Test_Actual = GHI_Test_Actual(1:min_len); YPred_GHI = YPred_GHI(1:min_len);
+
+residuals = GHI_Test_Actual - YPred_GHI;
+rmse = sqrt(mean(residuals.^2));
+mae = mean(abs(residuals));
+r2 = 1 - (sum(residuals.^2) / sum((GHI_Test_Actual - mean(GHI_Test_Actual)).^2));
+
+fprintf('\n--- Final Model Results ---\n');
+fprintf('RMSE: %.2f W/m²\n', rmse);
+fprintf('MAE : %.2f W/m²\n', mae);
+fprintf('R2  : %.4f\n', r2);
+fprintf('----------------------------\n');
+
+save(best_model_filename, 'net_best', 'bestHyperparameters', 'mu_X', 'sig_X', 'Y_min', 'Y_max', 'features_list');
+disp('>>> Process Completed Successfully.');
+
+function ObjFcn = makeObjFcn(XTrain, YTrain, XVal, YVal, num_feats, Y_min, Y_max)
+    ObjFcn = @valErrorFun;
+    function [valError, cons] = valErrorFun(params)
+        layers = [
+            sequenceInputLayer(num_feats)
+            convolution1dLayer(3, 64, 'Padding', 'same')
+            batchNormalizationLayer
+            reluLayer
+            dropoutLayer(params.DropoutRate)
+            bilstmLayer(params.BiLSTMUnits, 'OutputMode', 'last')
+            dropoutLayer(params.DropoutRate)
+            fullyConnectedLayer(64)
+            reluLayer
+            fullyConnectedLayer(1)
+            regressionLayer
+        ];
+        
+        options = trainingOptions('adam', ...
+            'MaxEpochs', 50, ...
+            'MiniBatchSize', 128, ...
+            'InitialLearnRate', params.InitialLearnRate, ...
+            'L2Regularization', params.L2Regularization, ...
+            'ValidationData', {XVal, YVal}, ...
+            'ValidationPatience', 10, ...
+            'Verbose', false, 'Plots', 'none');
+            
+        try
+            net = trainNetwork(XTrain, YTrain, layers, options);
+            YPred_Norm = predict(net, XVal);
+            YPred_GHI = YPred_Norm * (Y_max - Y_min) + Y_min;
+            YVal_GHI = YVal * (Y_max - Y_min) + Y_min;
+            YPred_GHI(YPred_GHI < 0) = 0;
+            valError = sqrt(mean((YVal_GHI - YPred_GHI).^2));
+        catch
+            valError = 1e6;
+        end
+        cons = [];
+    end
+end
+
+function [X_cells, Y_vec] = create_sequence_cells_local(X_data, Y_data, indices, seq_length)
+    num_samples = length(indices) - seq_length;
+    X_cells = cell(num_samples, 1);
+    Y_vec = zeros(num_samples, 1);
+    valid_start_indices = indices(1:end-seq_length);
+    for i = 1:num_samples
+        idx_start = valid_start_indices(i);
+        idx_end = idx_start + seq_length - 1;
+        X_cells{i} = X_data(idx_start:idx_end, :)'; 
+        Y_vec(i) = Y_data(idx_end + 1);
+    end
+end
